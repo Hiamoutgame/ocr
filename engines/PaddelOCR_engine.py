@@ -5,10 +5,10 @@ instead of Tesseract, optimized for Vietnamese financial documents.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, List, Any
 
 import numpy as np
-from paddleocr import PaddleOCR  # type: ignore[import-untyped]
+from paddleocr import PaddleOCR  # type: ignore
 from PIL import Image
 
 from config import Config
@@ -16,71 +16,91 @@ from core.exceptions import OCREngineError
 from core.interfaces import OCREngine
 
 
-class TesseractEngine(OCREngine):
+class PaddleOCREngine(OCREngine):
     """
     PaddleOCR-based engine (Vietnamese-optimized).
-
-    NOTE:
-        Tên class được giữ nguyên (`TesseractEngine`) để tránh phải sửa
-        toàn bộ các import hiện có trong project, nhưng implementation
-        bên trong đã chuyển sang dùng PaddleOCR.
+    
+    This engine uses PaddleOCR instead of Tesseract for better accuracy
+    with Vietnamese text, especially in financial reports.
     """
 
     def __init__(self, config: Optional[Config] = None) -> None:
-        self.config: Config = config or Config()
+            self.config: Config = config or Config()
 
-        # Map cấu hình ngôn ngữ cũ (ví dụ: "vie+eng") sang mã ngôn ngữ PaddleOCR.
-        lang = "vi"
-        if "en" in self.config.ocr_lang.lower() and "vi" not in self.config.ocr_lang.lower():
-            lang = "en"
+            # Logic chọn ngôn ngữ
+            lang = "vi"
+            if self.config.ocr_lang and "en" in self.config.ocr_lang.lower() and "vi" not in self.config.ocr_lang.lower():
+                lang = "en"
 
-        try:
-            # `use_gpu=False` mặc định cho môi trường không GPU.
-            # Nếu bạn có GPU, có thể set lại ở đây.
-            self._ocr = PaddleOCR(
-                lang=lang,
-                use_angle_cls=True,
-                use_gpu=False,
-                show_log=False,
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise OCREngineError(
-                "Không khởi tạo được PaddleOCR. "
-                "Hãy đảm bảo đã cài paddlepaddle và paddleocr."
-            ) from exc
+            try:
+                # --- CẤU HÌNH FIX LỖI CRASH TRÊN WINDOWS ---
+                self._ocr = PaddleOCR(
+                    lang=lang,
+                    
+                    # 1. Tắt tính năng xoay chiều (nguyên nhân chính tải thêm model UVDoc gây nặng máy)
+                    use_angle_cls=False,  
+                    
+                    # 2. Tắt bộ tăng tốc MKLDNN (nguyên nhân gây crash "terminated abruptly" với model v5)
+                    enable_mkldnn=False, 
+                    
+                
+                )
+            except Exception as exc:
+                message = (
+                    "Không khởi tạo được PaddleOCR. "
+                    f"Lỗi gốc: {exc}"
+                )
+                raise OCREngineError(message) from exc
 
     def preprocess_image(self, image: Image.Image) -> Image.Image:
         """
-        Tiền xử lý cơ bản cho PaddleOCR.
-
-        PaddleOCR đã có pipeline riêng cho detection/recognition, nên
-        ở đây ta chỉ cần đảm bảo ảnh ở dạng RGB. Nếu bạn muốn có
-        các bước enhance (denoise, sharpen, v.v.) thì có thể bổ sung
-        sau trong hàm này.
+        Convert PIL Image to RGB (PaddleOCR requirement).
         """
-        return image.convert("RGB")
+        if image.mode != 'RGB':
+            return image.convert('RGB')
+        return image
 
     def ocr_page(self, image: Image.Image) -> str:
         """
-        Chạy OCR 1 trang bằng PaddleOCR.
-
-        Trả về: text ghép từ tất cả các dòng nhận dạng được.
+        Chạy OCR 1 trang.
         """
-        # PaddleOCR nhận numpy array BGR hoặc đường dẫn file.
+        # 1. Chuẩn bị ảnh
         img = self.preprocess_image(image)
         np_img = np.array(img)
-        # RGB -> BGR
-        np_img = np_img[:, :, ::-1]
+        
+        # PaddleOCR dùng thư viện OpenCV (BGR) nên đôi khi cần đảo channel
+        # Tuy nhiên bản mới nhất thường tự xử lý, nhưng convert sang BGR là chuẩn nhất
+        # np_img = np_img[:, :, ::-1] 
 
         try:
-            result = self._ocr.ocr(np_img, cls=True)
-        except Exception as exc:  # noqa: BLE001
+            # 2. Gọi PaddleOCR
+            # result structure: [ [ [box], [text, score] ], ... ]
+            result = self._ocr.ocr(np_img)
+        except Exception as exc:
             raise OCREngineError(f"Lỗi khi chạy PaddleOCR: {exc}") from exc
 
-        lines: list[str] = []
-        # result: List[List[ [box, (text, score)] ]]
-        for line in result:
-            for _box, (text, _score) in line:
-                lines.append(text)
+        # --- FIX BUG: Xử lý trường hợp không tìm thấy chữ ---
+        if not result or result[0] is None:
+            return ""
 
+        # 3. Trích xuất text
+        # Paddle trả về list of lists (do hỗ trợ nhiều vùng ảnh), thường ta lấy result[0]
+        # Nhưng với bản mới, result chính là list các line.
+        
+        lines: List[str] = []
+        
+        # Kiểm tra cấu trúc trả về để loop cho đúng (PaddleOCR output hơi lộn xộn tùy version)
+        # Cách an toàn nhất: flatten list
+        ocr_result = result[0] if (len(result) > 0 and isinstance(result[0], list)) else result
+        
+        if ocr_result:
+            for line in ocr_result:
+                # line structure: [box_coords, (text_content, confidence)]
+                if line and len(line) >= 2:
+                    text_content = line[1][0]
+                    lines.append(text_content)
+
+        # Nối các dòng lại. 
+        # Lưu ý: Với báo cáo tài chính, nối bằng "\n" sẽ làm mất cấu trúc bảng (table).
+        # Nhưng ở bước này ta cứ lấy raw text trước.
         return "\n".join(lines).strip()

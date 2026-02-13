@@ -1,9 +1,6 @@
 """
-Financial OCR - Trích xuất văn bản từ Báo cáo tài chính.
-Hỗ trợ PDF (nhiều trang) và ảnh (PNG, JPG).
-Tối ưu tốc độ với ProcessPoolExecutor (CPU-bound) + PaddleOCR cho tiếng Việt.
+Financial OCR - Main Entry Point.
 """
-
 from __future__ import annotations
 
 import os
@@ -13,7 +10,15 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
+# --- QUAN TRỌNG: FIX LỖI CRASH KHI MULTIPROCESSING ---
+# Phải đặt trước khi import bất kỳ thư viện deep learning nào (numpy, paddle, torch)
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# Giới hạn mỗi process Paddle chỉ dùng 1 luồng CPU để tránh tranh chấp tài nguyên
+# Vì chúng ta đã dùng ProcessPoolExecutor để chia việc rồi.
+os.environ["OMP_NUM_THREADS"] = "1" 
+
 import numpy as np
+from PIL import Image
 
 from config import Config
 from core.exceptions import (
@@ -25,19 +30,23 @@ from upload.image_loader import ImageLoader
 from upload.pdf_loader import PdfLoader
 from utils.worker import process_single_page
 
-
-def _load_images(file_path: str | Path, config: Config) -> list["Image.Image"]:  # type: ignore[name-defined]
+def _load_images(file_path: str | Path, config: Config) -> list[Image.Image]:
     """
-    Load PDF or image files into a list of PIL.Image objects using
-    the dedicated loader implementations.
+    Load PDF or image files into a list of PIL.Image objects.
     """
     path = Path(file_path)
+    if not path.exists():
+        raise DocumentNotFoundError(f"File not found: {path}")
+
     ext = path.suffix.lower()
 
+    # Factory logic đơn giản
     if ext == ".pdf":
         loader = PdfLoader(config=config)
-    else:
+    elif ext in ImageLoader.SUPPORTED_EXTENSIONS:
         loader = ImageLoader()
+    else:
+        raise DocumentTypeNotSupportedError(f"Unsupported file type: {ext}")
 
     return loader.load(path)
 
@@ -48,115 +57,99 @@ def process_input(
     output_path: Optional[str | Path] = None,
     max_workers: Optional[int] = None,
 ) -> str:
-    """
-    Main OCR pipeline:
-        Load -> Preprocess + OCR (song song, ProcessPoolExecutor) -> Ghi file.
-
-    Returns:
-        Toàn bộ text đã trích xuất từ tài liệu.
-    """
     start_time = time.perf_counter()
 
-    # Load images (PDF nhiều trang hoặc 1 ảnh).
+    # 1. Load Images
+    print(f"Loading document: {file_path}...", file=sys.stderr)
     try:
         images = _load_images(file_path, config)
-    except (DocumentNotFoundError, DocumentTypeNotSupportedError, ImportError) as exc:
-        print(f"[LỖI] {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[ERROR] Loading failed: {exc}", file=sys.stderr)
         return ""
 
     if not images:
-        print("[LỖI] Không có trang nào để xử lý.", file=sys.stderr)
+        print("[ERROR] No pages loaded.", file=sys.stderr)
         return ""
 
-    # Chuẩn bị args cho worker (numpy array để picklable).
+    print(f"Loaded {len(images)} pages. Preparing workers...", file=sys.stderr)
+
+    # 2. Prepare Data for Multiprocessing
+    # Convert PIL Image -> Numpy Array để có thể Pickle (gửi qua Process khác)
     worker_args = [
         (
             np.array(img),
-            config.tesseract_cmd,
             config.ocr_lang,
-            config.ocr_psm,
-            config.ocr_oem,
-            config.use_otsu,
         )
         for img in images
     ]
 
-    # ProcessPoolExecutor: CPU-bound nên dùng Process.
-    n_workers = max_workers or min(len(images), (os.cpu_count() or 4) - 1 or 1)
+    # 3. Determine Workers Strategy
+    # PaddleOCR tốn RAM, nên không dùng hết CPU core. 
+    # Mặc định an toàn là 2 hoặc 4 workers.
+    default_workers = 2 
+    if os.cpu_count() and os.cpu_count() > 4:
+        default_workers = 4
+    
+    n_workers = max_workers or min(len(images), default_workers)
+    
     texts: list[str] = [""] * len(images)
+    print(f"Starting OCR with {n_workers} worker processes...", file=sys.stderr)
 
+    # 4. Execute Parallel Processing
     try:
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = {
-                executor.submit(
-                    process_single_page,
-                    *args,
-                ): i
+            # Map future to page index
+            future_to_idx = {
+                executor.submit(process_single_page, *args): i
                 for i, args in enumerate(worker_args)
             }
-            for future in as_completed(futures):
-                idx = futures[future]
+
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
                 try:
-                    texts[idx] = future.result()
-                except (OCREngineError, Exception) as exc:  # noqa: BLE001
-                    print(f"[LỖI] Trang {idx + 1}: {exc}", file=sys.stderr)
-    except OCREngineError as exc:
-        print(f"[LỖI] OCR Engine: {exc}", file=sys.stderr)
+                    result = future.result()
+                    texts[idx] = result
+                    print(f"✓ Completed page {idx + 1}/{len(images)}", file=sys.stderr)
+                except Exception as exc:
+                    print(f"✗ Failed page {idx + 1}: {exc}", file=sys.stderr)
+                    
+    except KeyboardInterrupt:
+        print("\n[STOP] Process interrupted by user.", file=sys.stderr)
         return ""
 
-    full_text = "\n\n".join(texts)
+    # 5. Save Results
+    full_text = "\n\n--- PAGE BREAK ---\n\n".join(texts)
+    
+    if output_path:
+        out_path = Path(output_path)
+    else:
+        results_dir = Path("./results")
+        results_dir.mkdir(exist_ok=True)
+        out_path = results_dir / f"{Path(file_path).stem}.txt"
+
+    out_path.write_text(full_text, encoding="utf-8")
+    
     elapsed = time.perf_counter() - start_time
-
-    # Ghi file .txt (tên trùng input nếu không chỉ định khác).
-    out_path = output_path or Path(file_path).with_suffix(".txt")
-    Path(out_path).write_text(full_text, encoding="utf-8")
-
-    print(
-        f"Processed {len(images)} pages in {elapsed:.2f} seconds",
-        file=sys.stderr,
-    )
+    print(f"\nAll done! Processed {len(images)} pages in {elapsed:.2f}s", file=sys.stderr)
+    print(f"Output saved to: {out_path}", file=sys.stderr)
+    
     return full_text
 
 
 def main() -> None:
-    """CLI đơn giản cho Financial OCR (PaddleOCR)."""
     import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Financial OCR - Trích xuất văn bản từ Báo cáo tài chính",
-    )
-    parser.add_argument("input", help="File PDF hoặc ảnh (PNG, JPG)")
-    parser.add_argument(
-        "-o",
-        "--output",
-        help="File .txt output (mặc định: cùng tên input)",
-    )
-    parser.add_argument(
-        "-w",
-        "--workers",
-        type=int,
-        help="Số worker (mặc định: CPU - 1)",
-    )
-    parser.add_argument(
-        "-p",
-        "--poppler",
-        help="Đường dẫn Poppler (cho PDF, dùng bởi pdf2image)",
-    )
+    parser = argparse.ArgumentParser(description="Financial OCR (PaddleOCR)")
+    parser.add_argument("input", help="Input file (PDF/Image)")
+    parser.add_argument("-o", "--output", help="Output .txt file")
+    parser.add_argument("-w", "--workers", type=int, help="Number of workers (default: auto)")
+    parser.add_argument("-p", "--poppler", help="Poppler bin path")
     args = parser.parse_args()
 
-    # Khởi tạo Config từ CLI + default.
     config = Config()
     if args.poppler:
         config.poppler_path = args.poppler
 
-    text = process_input(
-        file_path=args.input,
-        config=config,
-        output_path=args.output,
-        max_workers=args.workers,
-    )
-    print(text)
-
+    process_input(args.input, config, args.output, args.workers)
 
 if __name__ == "__main__":
     main()

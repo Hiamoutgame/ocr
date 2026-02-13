@@ -8,5 +8,5 @@ imports in the project.
 
 from __future__ import annotations
 
-from .PaddelOCR_engine import TesseractEngine  # noqa: F401
+from .PaddelOCR_engine import PaddleOCREngine  # noqa: F401
 

@@ -1,46 +1,39 @@
 """
-Worker functions for multiprocessing (ProcessPoolExecutor).
-
-IMPORTANT: All functions used by ProcessPoolExecutor must be defined
-at module top-level to remain picklable, especially on Windows.
+Worker functions for multiprocessing.
 """
-
 from __future__ import annotations
-
 from typing import Optional
-
 import numpy as np
 from PIL import Image
 
 from config import Config
-from engines.PaddelOCR_engine import TesseractEngine
+from core.exceptions import OCREngineError
 
+# --- SỬA IMPORT TẠI ĐÂY ---
+# Đã đổi tên file từ PaddelOCR_engine -> paddle_engine
+try:
+    from engines.paddle_engine import PaddleOCREngine
+except ImportError:
+    # Fallback nếu bạn chưa đổi tên file
+    from engines.PaddelOCR_engine import PaddleOCREngine 
 
-def process_single_page(
-    image_array: np.ndarray,
-    tesseract_cmd: Optional[str],
-    lang: str,
-    psm: int,
-    oem: int,
-    use_otsu: bool,
-) -> str:
-    """
-    Process a single page: preprocessing + OCR.
+# ... (Phần còn lại của file worker.py giữ nguyên như cũ vì logic Singleton đã đúng) ...
+_engine_instance: Optional[PaddleOCREngine] = None
+_engine_config: Optional[Config] = None
 
-    This function is intended to be executed inside worker processes
-    managed by ProcessPoolExecutor.
-    """
-    config = Config(
-        tesseract_cmd=tesseract_cmd,
-        ocr_lang=lang,
-        ocr_psm=psm,
-        ocr_oem=oem,
-        use_otsu=use_otsu,
-    )
-    engine = TesseractEngine(config=config)
+def _get_global_engine(ocr_lang: str) -> PaddleOCREngine:
+    global _engine_instance, _engine_config
+    if _engine_instance is None or (_engine_config and _engine_config.ocr_lang != ocr_lang):
+        # print(f"Init PaddleOCR in worker (PID: {os.getpid()})...") 
+        config = Config(ocr_lang=ocr_lang)
+        _engine_config = config
+        _engine_instance = PaddleOCREngine(config=config)
+    return _engine_instance
 
-    # Convert numpy array back to PIL.Image for the engine.
-    image = Image.fromarray(image_array)
-    preprocessed = engine.preprocess_image(image)
-    return engine.ocr_page(preprocessed)
-
+def process_single_page(image_array: np.ndarray, ocr_lang: str) -> str:
+    try:
+        engine = _get_global_engine(ocr_lang)
+        image = Image.fromarray(image_array)
+        return engine.ocr_page(image)
+    except Exception as exc:
+        raise OCREngineError(f"Worker Error: {exc}") from exc
