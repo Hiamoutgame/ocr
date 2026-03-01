@@ -136,7 +136,7 @@ class TextRecognizer:
 
     def __init__(self, model_dir=None, device_id: int | None = None):
         # seq2seq config from vietocr (uses built-in weights download)
-        config = Cfg.load_config_from_name('vgg_seq2seq')
+        config = Cfg.load_config_from_name('vgg_transformer')
 
         config['cnn']['pretrained'] = True
         config['device'] = 'cpu'
@@ -175,7 +175,7 @@ class TextDetector:
             }
         }]
         postprocess_params = {"name": "DBPostProcess", "thresh": 0.3, "box_thresh": 0.5, "max_candidates": 1000,
-                              "unclip_ratio": 1.5, "use_dilation": False, "score_mode": "fast", "box_type": "quad"}
+                              "unclip_ratio": 2.0, "use_dilation": False, "score_mode": "fast", "box_type": "quad"}
 
         self.postprocess_op = build_post_process(postprocess_params)
         self.predictor, self.run_options = load_model(model_dir, 'det', device_id)
@@ -316,38 +316,45 @@ class OCR:
         self.crop_image_res_index = 0
 
     def get_rotate_crop_image(self, img, points):
-        '''
-        img_height, img_width = img.shape[0:2]
-        left = int(np.min(points[:, 0]))
-        right = int(np.max(points[:, 0]))
-        top = int(np.min(points[:, 1]))
-        bottom = int(np.max(points[:, 1]))
-        img_crop = img[top:bottom, left:right, :].copy()
-        points[:, 0] = points[:, 0] - left
-        points[:, 1] = points[:, 1] - top
-        '''
-        assert len(points) == 4, "shape of points must be 4*2"
-        img_crop_width = int(
-            max(
-                np.linalg.norm(points[0] - points[1]),
-                np.linalg.norm(points[2] - points[3])))
-        img_crop_height = int(
-            max(
-                np.linalg.norm(points[0] - points[3]),
-                np.linalg.norm(points[1] - points[2])))
-        pts_std = np.float32([[0, 0], [img_crop_width, 0],
-                              [img_crop_width, img_crop_height],
-                              [0, img_crop_height]])
-        M = cv2.getPerspectiveTransform(points, pts_std)
-        dst_img = cv2.warpPerspective(
-            img,
-            M, (img_crop_width, img_crop_height),
-            borderMode=cv2.BORDER_REPLICATE,
-            flags=cv2.INTER_CUBIC)
-        dst_img_height, dst_img_width = dst_img.shape[0:2]
-        if dst_img_height * 1.0 / dst_img_width >= 1.5:
-            dst_img = np.rot90(dst_img)
-        return dst_img
+            assert len(points) == 4, "shape of points must be 4*2"
+            
+            # --- CODE MỚI: Thêm pixel đệm (Padding) ---
+            pad_h = 4  # Tăng thêm 4 pixel ở trên và dưới để lấy trọn vẹn dấu ^, ễ, ệ...
+            pad_w = 2  # Tăng thêm 2 pixel 2 bên ngang
+            
+            img_crop_width = int(
+                max(
+                    np.linalg.norm(points[0] - points[1]),
+                    np.linalg.norm(points[2] - points[3])))
+            img_crop_height = int(
+                max(
+                    np.linalg.norm(points[0] - points[3]),
+                    np.linalg.norm(points[1] - points[2])))
+                    
+            # Kích thước ảnh đầu ra được cộng thêm padding
+            out_width = img_crop_width + pad_w * 2
+            out_height = img_crop_height + pad_h * 2
+            
+            # Căn chỉnh để 4 điểm gốc lọt vào giữa tâm (chừa lại lề pad_w, pad_h)
+            pts_std = np.float32([
+                [pad_w, pad_h], 
+                [pad_w + img_crop_width, pad_h],
+                [pad_w + img_crop_width, pad_h + img_crop_height],
+                [pad_w, pad_h + img_crop_height]
+            ])
+            
+            M = cv2.getPerspectiveTransform(points, pts_std)
+            # BORDER_REPLICATE giúp lấp đầy màu nền an toàn nếu cắt lem ra ngoài rìa ảnh
+            dst_img = cv2.warpPerspective(
+                img,
+                M, (out_width, out_height),
+                borderMode=cv2.BORDER_REPLICATE,
+                flags=cv2.INTER_CUBIC)
+                
+            dst_img_height, dst_img_width = dst_img.shape[0:2]
+            if dst_img_height * 1.0 / dst_img_width >= 1.5:
+                dst_img = np.rot90(dst_img)
+            return dst_img
 
     def sorted_boxes(self, dt_boxes):
         """
