@@ -1,157 +1,98 @@
 <p align="center">
   <a href="./README.md">Tiếng Việt</a> |
-  <a href="./README_en.md">English</a> |
+  <a href="./README_en.md">English</a>
 </p>
 
-# *Deep*Doc + VietOCR - Fast and Cost-effective OCR Tool for Vietnamese
+# DeepDoc + VietOCR — Vietnamese OCR with layout & table support
 
-- [1. Introduction](#1)
-- [2. Architecture](#2)
-- [3. Installation & Running](#3)
+CPU-friendly OCR pipeline combining **ONNX text detection** (Paddle-style), **VietOCR** (Vietnamese recognition), **Layout Recognizer**, and **Table Structure Recognizer** (YOLOv10 ONNX) to output text and layout-preserving Markdown.
 
-<a name="1"></a>
+---
 
-## 1. Introduction
+## Contents
 
-With a wide range of documents from various sources and formats, along with diverse retrieval requirements, an accurate extraction tool is essential for any business. Today, I'd like to introduce DeepDoc, a very fast and cost-efficient OCR tool that only requires running on a CPU. In addition, it also comes with Layout Recognizer and Table Structure Recognizer features, which help preserve the document's formatting after OCR.
+- [Installation](#installation)
+- [How to run](#how-to-run)
+- [Scripts and when to use them](#scripts-and-when-to-use-them)
+- [Technical architecture](#technical-architecture)
+- [References](#references)
 
-However, DeepDoc has not yet been standardized for Vietnamese, so I replaced the Text Recognizer with VietOCR and the ONNX version to achieve better Vietnamese text recognition. You can also check out the original version of DeepDoc [here](https://github.com/infiniflow/ragflow/blob/main/deepdoc/README.md). Moreover, since DeepDoc is essentially a data processing component for the RAG pipeline in the RAGFlow project, I separated it into an independent Git repository so the application can be customized more conveniently.
+---
 
-<a name="2"></a>
+## Installation
 
-## 2. Architecture
-### 2.1 OCR
-In this part, DeepDoc uses PaddleOCR - a very popular open-source tool developed by Baidu - after converting it into ONNX. Basically, ONNX (Open Neural Network Exchange) is an open format for AI models, allowing export and import of models between multiple frameworks (PyTorch, TensorFlow, etc.). It enables cross-platform compatibility, optimizes inference speed on CPU/GPU, and reduces infrastructure costs when deployed (we won't go too deep into this topic here).
+**Requirements:** Python 3.10+
 
-DeepDoc does not specify which version it uses, since after conversion to ONNX it's difficult to determine. To get an idea of how it works, I'll refer to the OCR architecture PP-OCRv5 from the latest PaddleOCR 3.0, which includes four main components:
-
-- Image Preprocessing Module: Enhances image quality, handles rotation/skew using orientation classification (PP-LCNet) and unwarping (UVDoc).
-
-- Text Detection: Upgraded from PP-OCRv4 with backbone PP-HGNetV2, knowledge distillation from GOT-OCR2.0, and data augmentation (synthetic generation, rotation, blur, distortion). Retains PFHead and DSR from the previous version.
-
-- Text Line Orientation Classification: Automatically detects and corrects text line orientation (flipped, rotated) to prepare for recognition.
-
-- Text Recognition: Two-branch architecture with PP-HGNetV2, trained with GTC-NRTR (attention-based) to guide SVTR-HGNet (CTC, lightweight, fast). Training data is augmented with documents, PDFs, e-books, and synthetic handwriting samples.
-
-<div align="center" style="margin-top:20px;margin-bottom:20px;">
-    <img src="img\x6.png" width="900"/>
-</div>
-
-For more details about PP-OCRv5, you can refer to the official documentation [here](https://arxiv.org/html/2507.05595v1).
-
-As mentioned above, the Recognition module of Paddle has been replaced with VietOCR and its ONNX version to achieve more accurate Vietnamese text recognition. VietOCR is already a very popular OCR tool in Vietnam, so I won't go into details here - you can explore more about it [here](https://github.com/pbcquoc/vietocr). For the process of converting VietOCR into the ONNX format, I referred to [this article](https://viblo.asia/p/chuyen-doi-mo-hinh-hoc-sau-ve-onnx-bWrZnz4vZxw).
-
-### 2.2 Layout Recognizer & Table Structure Recognizer
-In this part, DeepDoc uses YOLOv10 (You Only Look Once) - also a popular object detection method - in its ONNX version.
-
-The basic architecture consists of three main components:
-- Backbone: Extracts features from the image, using a lightweight and efficient design (retaining the ideas from YOLOv8 but improving the blocks to reduce computation).
-- Neck: Combines multi-scale features (an improved FPN/PAN) to detect both small and large objects effectively.
-- Head: Uses an anchor-free decoupled head (separating classification and regression branches), which improves accuracy and makes training easier.
-
-<div align="center" style="margin-top:20px;margin-bottom:20px;">
-    <img src="img\af645ed9-7301-4ec4-81e7-cb996ddf2d7f.webp" width="900"/>
-</div>
-
-
-In DeepDoc, YOLOv10 is trained to recognize label types for both Layout Recognizer and Table Structure Recognizer, covering most common cases.
-
-For Layout Recognizer, there are 10 categories:
-- Text
-- Title
-- Image
-- Image Caption
-- Table
-- Table Caption
-- Header
-- Footer
-- Reference
-- Equation
-
-For Table Structure Recognition, there are 5 types:
-- Column
-- Row
-- Column header
-- Projected row header
-- Spanning cell
-
-To understand more about YOLOv10, you can refer to the official documentation [here](https://arxiv.org/pdf/2405.14458).
-
-<a name="3"></a>
-
-## 3. Installation and Testing
-
-First, clone the git repository:
 ```bash
-git clone https://github.com/hoaivannguyen/deepdoc_vietocr.git
-```
-Some setup options before running the program:
-```bash
-python t_ocr.py -h
-usage: t_ocr.py [-h] --inputs INPUTS [--output_dir OUTPUT_DIR]
-
-options:
-  -h, --help            Display this help message and exit
-  --inputs INPUTS       Directory containing images or PDF files, or a file path to a single image or PDF file
-  --output_dir OUTPUT_DIR
-                        Directory to store output images. Default:'./ocr_outputs'
-```
-```bash
-python t_recognizer.py -h
-usage: t_recognizer.py [-h] --inputs INPUTS [--output_dir OUTPUT_DIR] [--threshold THRESHOLD] [--mode {layout,tsr}]
-
-options:
-  -h, --help            Display this help message and exit
-  --inputs INPUTS       Directory containing images or PDF files, or a file path to a single image or PDF file
-  --output_dir OUTPUT_DIR
-                        Directory to store output images. Default: './layouts_outputs'
-  --threshold THRESHOLD
-                        Threshold for filtering detections. Default: 0.5
-  --mode {layout,tsr}   Task mode: layout recognizer (layout) or table structure recognizer (tsr)
-```
-### 3.1. OCR
-To test OCR, you can use the following command:
- ```bash
-python t_ocr.py --inputs=path_to_images_or_pdfs --output_dir=path_to_store_result
-```
-The input can be a directory containing images or PDFs, or a single image or PDF file. The output will include 1 image with the detected bounding boxes and 1 text file containing the OCR text.
-<div align="center" style="margin-top:20px;margin-bottom:20px;">
-<img src="img\Screenshot 2025-08-28 171633.png" width="900"/>
-</div>
-
-I'm currently using VietOCR Seq2seq as the default since it runs relatively fast and accurately. You can switch to VietOCR Transformer in module/ocr.py, but I don't recommend it because the processing time is much longer while the accuracy doesn't improve significantly. If you want maximum speed, you can switch to the ONNX version by importing ocr_onnx instead of ocr, though the accuracy will decrease slightly.
-
-### 3.2. Layout Recognizer
-Try the following command to see the result of the Layout Recognizer:
-```bash
-python t_recognizer.py --inputs=path_to_images_or_pdfs --threshold=0.2 --mode=layout --output_dir=path_to_store_result
-```
-The input can be a directory containing images or PDFs, or a single image or PDF file. The output will include 1 image with the detected labels as shown below:
-<div align="center" style="margin-top:20px;margin-bottom:20px;">
-<img src="img\49806-Article Text-153529-1-10-20200804_page-0002.jpg" width="1000"/>
-</div>
-
-### 3.3. Table Structure Recognizer
-Try the following command to see the TSR result:
-```bash
-python t_recognizer.py --inputs=path_to_images_or_pdfs --threshold=0.2 --mode=tsr --output_dir=path_to_store_result
+git clone <repo_url>
+cd ocr
+python -m venv .venv
+.venv\Scripts\activate   # Windows
+# source .venv/bin/activate   # Linux/macOS
+pip install -r requirements.txt
 ```
 
-The input can be a directory containing images or PDFs, or a single image or PDF file. The output will include 1 image with the detected labels and 1 markdown file with the table content.
-<div align="center" style="margin-top:20px;margin-bottom:20px;">
-<img src="img\Screenshot 2025-08-28 182132.png" width="1000"/>
-</div>
+ONNX models (detection, layout, TSR) are downloaded from Hugging Face on first run (or place them in `onnx/`).
 
-## Conclusion
-I hope you find this tool useful and applicable in practice. If you have any feedback, please leave it in the comments below. Thank you for reading!
+---
+
+## How to run
+
+| Script | Purpose | Example |
+|--------|--------|--------|
+| **t_ocr.py** | OCR only (detect + recognize) | `python t_ocr.py --inputs ./pdfs --output_dir ./ocr_outputs` |
+| **t_recognizer.py** | Layout or TSR only (draw boxes, export table) | `python t_recognizer.py --inputs ./pdfs --mode layout --threshold 0.2 --output_dir ./layout_out` |
+| **full_pipeline.py** | Layout + OCR + tables → **one layout-preserving Markdown file** | `python full_pipeline.py --inputs ./pdfs --output_dir ./layout_md_outputs --threshold 0.2` |
+
+**Input:** `--inputs` can be:
+- A single image or PDF file
+- A directory of images/PDFs (traversed recursively)
+
+**Output:**
+- **t_ocr:** Image with drawn boxes + `.txt` + `.md` (bullet list) per page/image.
+- **t_recognizer:** Image with layout/TSR boxes; with `--mode tsr` adds a table `.md` (whole image as one table).
+- **full_pipeline:** Per-page `*_full.md`; per document **`<document_name>_layout.md`** (single Markdown file for the whole document, reading order 1/2 column, title, paragraphs, tables, figures). Use `--debug_json` to also write `*_layout.json` (ordered layout regions).
+
+---
+
+## Scripts and when to use them
+
+| Need | Script |
+|------|--------|
+| Quick text extraction, no structure | **t_ocr.py** |
+| Inspect layout regions (title, text, table, figure…) or extract one table from an image | **t_recognizer.py** (layout or tsr) |
+| **One Markdown file per document** with layout close to the PDF | **full_pipeline.py** |
+
+---
+
+## Technical architecture
+
+### OCR
+
+- **Detection:** PaddleOCR-style model in ONNX (text region detection).
+- **Recognition:** VietOCR (default: vgg_seq2seq, CPU). Optional ONNX recognizer in `module/ocr_onnx.py` for faster inference (change import in scripts).
+- Pipeline: Image → resize/normalize → ONNX detection → crop lines → VietOCR → text.
+
+See Paddle PP-OCR architecture (e.g. [PP-OCRv5](https://arxiv.org/html/2507.05595v1)). Original recognition is replaced by VietOCR for Vietnamese; VietOCR-to-ONNX conversion: [Viblo article](https://viblo.asia/p/chuyen-doi-mo-hinh-hoc-sau-ve-onnx-bWrZnz4vZxw).
+
+### Layout Recognizer & Table Structure Recognizer
+
+- **Layout:** YOLOv10 ONNX — 10 classes: Text, Title, Figure, Figure caption, Table, Table caption, Header, Footer, Reference, Equation.
+- **TSR:** Same YOLOv10 backbone — table structure (column, row, header, spanning cell…) for Markdown table output.
+
+Details: [YOLOv10 arxiv](https://arxiv.org/pdf/2405.14458).
+
+### Full pipeline (layout-preserving Markdown)
+
+- `module/layout_ordering.py`: Reading-order (1-column / 2-column) for layout regions.
+- `module/layout_to_markdown.py`: Renders region types (title → `#`, text → paragraph, table → markdown table, figure → placeholder + caption) to Markdown.
+- `full_pipeline.py`: Runs Layout Recognizer → OCR per region → TSR for table regions → reading order → render → writes `*_full.md` and `<doc>_layout.md`.
+
+---
 
 ## References
-DeepDoc repo: https://github.com/infiniflow/ragflow/blob/main/deepdoc/README.md
 
-PP-OCRv5: https://arxiv.org/html/2507.05595v1
-
-VietOCR: https://github.com/pbcquoc/vietocr
-
-VietOCR ONNX: https://viblo.asia/p/chuyen-doi-mo-hinh-hoc-sau-ve-onnx-bWrZnz4vZxw
-
-YOLOv10: https://arxiv.org/pdf/2405.14458
+- [DeepDoc (RAGFlow)](https://github.com/infiniflow/ragflow/blob/main/deepdoc/README.md)
+- [PP-OCRv5](https://arxiv.org/html/2507.05595v1)
+- [VietOCR](https://github.com/pbcquoc/vietocr)
+- [YOLOv10](https://arxiv.org/pdf/2405.14458)

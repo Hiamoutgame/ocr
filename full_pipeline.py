@@ -5,6 +5,9 @@ import argparse
 import numpy as np
 import re
 import time
+from collections import defaultdict
+from typing import Dict, List, Tuple
+import json
 
 sys.path.insert(
     0,
@@ -16,6 +19,8 @@ sys.path.insert(
 
 from module.ocr import OCR 
 from module import LayoutRecognizer, TableStructureRecognizer, init_in_out
+from module.layout_ordering import build_reading_order
+from module.layout_to_markdown import render_page_markdown
 
 from datetime import datetime
 
@@ -100,62 +105,126 @@ def extract_table_markdown(img, table_region, ocr):
     markdown = TableStructureRecognizer.construct_table(boxes, markdown=True)
     return markdown
 
+
+def normalize_layout_region(region: Dict) -> Dict:
+    """Normalize layout region into common dict schema."""
+    bbox = region.get("bbox", [region.get("x0", 0), region.get("top", 0), region.get("x1", 0), region.get("bottom", 0)])
+    x0, y0, x1, y1 = [int(float(v)) for v in bbox]
+    return {
+        "type": (region.get("type", "") or "").lower(),
+        "score": float(region.get("score", 1.0) or 1.0),
+        "bbox": [x0, y0, x1, y1],
+        "content": "",
+    }
+
+
+def ocr_region_text(img, bbox: List[int], ocr: OCR) -> str:
+    """OCR text content from one region bbox."""
+    x0, y0, x1, y1 = bbox
+    if x1 <= x0 or y1 <= y0:
+        return ""
+    region_img = img.crop((x0, y0, x1, y1))
+    ocr_results = ocr(np.array(region_img))
+    if not ocr_results:
+        return ""
+    text_lines = [t[0].strip() for _, t in ocr_results if t and t[0] and t[0].strip()]
+    return "\n".join(text_lines).strip()
+
+
+def page_doc_key(output_path: str) -> str:
+    """
+    Group per-page outputs by source document key.
+    Example: xxx.pdf_0.jpg -> xxx.pdf
+    """
+    name = os.path.basename(output_path)
+    return re.sub(r"_(\d+)\.jpg$", "", name)
+
 def main(args):
     images, outputs = init_in_out(args)
     print(f"Loaded {len(images)} images")
     print(f"Output paths: {outputs}")
     layout_recognizer = LayoutRecognizer("layout")
     ocr = OCR()
+    doc_pages_md: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+
     for idx, img in enumerate(images):
         print(f"Processing image {idx}: {outputs[idx]}")
         start_time = time.time()  # <-- Start timing
 
         layouts = layout_recognizer.forward([img], thr=float(args.threshold))[0]
         print(f"Detected {len(layouts)} layout regions")
-        region_and_pos = []
+        normalized_regions: List[Dict] = [normalize_layout_region(r) for r in layouts]
 
-        from PIL import Image, ImageDraw
-
-        # Create a mask for detected regions
-        mask = Image.new("1", img.size, 0)
-        draw = ImageDraw.Draw(mask)
-        for region in layouts:
-            if "bbox" in region:
-                x0, y0, x1, y1 = map(int, region["bbox"])
+        # Fill region content by type
+        for r in normalized_regions:
+            rtype = r["type"]
+            if rtype in {"header", "footer", "reference"}:
+                continue
+            if rtype == "table":
+                print(f"Extracting table markdown for region: {r['bbox']}")
+                r["content"] = extract_table_markdown(img, r, ocr)
+            elif rtype == "figure":
+                # figure body is placeholder; caption might be a nearby separate region
+                r["content"] = ""
             else:
-                x0, y0, x1, y1 = map(int, [region.get("x0", 0), region.get("top", 0), region.get("x1", 0), region.get("bottom", 0)])
-            draw.rectangle([x0, y0, x1, y1], fill=1)
+                r["content"] = ocr_region_text(img, r["bbox"], ocr)
 
-        for region in layouts:
-            label = region.get("type", "").lower()
-            score = region.get("score", 1.0)
-            bbox = region.get("bbox", [region.get("x0", 0), region.get("top", 0), region.get("x1", 0), region.get("bottom", 0)])
-            y_pos = bbox[1]  # Use top y as position for ordering
-            if label in ["table"] and score >= float(args.threshold):
-                print(f"Extracting table markdown for region: {region}")
-                markdown = extract_table_markdown(img, region, ocr)
-                region_and_pos.append((y_pos, markdown))
+        # Attach nearby figure/table captions to owner block
+        for caption in [x for x in normalized_regions if x["type"] in {"figure caption", "table caption"}]:
+            cx0, cy0, cx1, cy1 = caption["bbox"]
+            best = None
+            best_dist = 10**9
+            for owner in normalized_regions:
+                if caption["type"] == "figure caption" and owner["type"] != "figure":
+                    continue
+                if caption["type"] == "table caption" and owner["type"] != "table":
+                    continue
+                ox0, oy0, ox1, oy1 = owner["bbox"]
+                x_overlap = max(0, min(cx1, ox1) - max(cx0, ox0))
+                y_dist = min(abs(cy0 - oy1), abs(oy0 - cy1))
+                score = y_dist - (0.1 * x_overlap)
+                if score < best_dist:
+                    best_dist = score
+                    best = owner
+            if best and caption.get("content"):
+                if best.get("content"):
+                    best["content"] = f"{best['content']}\n{caption['content']}"
+                else:
+                    best["content"] = caption["content"]
 
-        # Now OCR any remaining undetected area (including non-table/figure)
-        inv_mask = mask.point(lambda p: 1 - p)
-        if inv_mask.getbbox():
-            x0, y0, x1, y1 = inv_mask.getbbox()
-            region_img = img.crop((x0, y0, x1, y1))
-            ocr_results = ocr(np.array(region_img))
-            text = "\n".join([t[0] for _, t in ocr_results if t and t[0]])
-            region_and_pos.append((y0, text))
+        # Build reading order and render page markdown
+        ordered_regions = build_reading_order(normalized_regions, img.size[0], img.size[1])
+        markdown_concat = render_page_markdown(ordered_regions)
 
-        # Sort by y position to preserve original order
-        region_and_pos.sort(key=lambda x: x[0])
-        markdown_concat = "\n\n".join([item[1] for item in region_and_pos])
+        # Page-level markdown output
         out_path = outputs[idx] + "_full.md"
         print(f"Writing concatenated markdown to: {out_path}")
         with open(out_path, "w+", encoding='utf-8') as f:
             f.write(markdown_concat)
         logging.info(f"Saved concatenated markdown to: {out_path}")
 
+        # Optional debug regions
+        if args.debug_json:
+            with open(outputs[idx] + "_layout.json", "w+", encoding="utf-8") as f:
+                json.dump(ordered_regions, f, ensure_ascii=False, indent=2)
+
+        # Accumulate for document-level markdown
+        key = page_doc_key(outputs[idx])
+        page_idx_match = re.search(r"_(\d+)\.jpg$", os.path.basename(outputs[idx]))
+        page_num = int(page_idx_match.group(1)) if page_idx_match else idx
+        doc_pages_md[key].append((page_num, markdown_concat))
+
         elapsed = time.time() - start_time  # <-- End timing
         print(f"Processing image {idx} done in {elapsed:.2f} seconds")  # <-- Print elapsed time
+
+    # Write one combined markdown per document
+    for key, pages in doc_pages_md.items():
+        pages.sort(key=lambda x: x[0])
+        combined = "\n\n---\n\n".join(p[1] for p in pages if p[1].strip())
+        doc_out = os.path.join(args.output_dir, f"{key}_layout.md")
+        with open(doc_out, "w+", encoding="utf-8") as f:
+            f.write(combined.strip())
+        print(f"Wrote document markdown: {doc_out}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -167,5 +236,7 @@ if __name__ == "__main__":
     parser.add_argument('--threshold',
                         help="Detection threshold. Default: 0.5",
                         default=0.5)
+    parser.add_argument('--debug_json', action='store_true',
+                        help="Write ordered layout regions to per-page JSON for debugging.")
     args = parser.parse_args()
     main(args)
