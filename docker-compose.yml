@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  ollama:
+    image: ollama/ollama
+    container_name: ollama-service
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  ocr:
+    build: .
+    container_name: ocr-service
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: python main.py --input "assets/sample.pdf" --output result.json
+    depends_on:
+      - ollama
+
+volumes:
+  ollama_data:
